@@ -12,25 +12,18 @@ Our team placed **top 3 in the G-Research Trading Game**. This repository presen
 
 ## The game
 
-Each round presents a shared reward. Teams independently choose whether to accept it. Accepting commits a team to a period of inactivity, even if another team accepts too and causes a collision.
+Each round presents a shared reward. Teams independently choose whether to accept it. Accepting triggers a lockout—even if another team accepts too and causes a collision.
 
-| Reward model | Game length | Default lockout | Collision rule |
+| Reward distribution | Game length | Default lockout | Collision outcome |
 |:---|:---|:---|:---|
-| Exponential, mean **10** | **2,000** rounds | **15** rounds | Multiple accepts: no payout, all accepting teams locked out |
+| Exponential, mean **10** | **2,000 rounds** | **15 rounds** | No payout; all accepting teams locked out |
 
-These are the Round 3 rules targeted by the model. A successful decision must account for both **competition now** and **opportunity cost later**.
+Under these Round 3 rules, a smaller reward can be more attractive if it is likely to go uncontested.
 
 ## Model overview
 
-The adaptive strategy in [`solution_round3_learning.py`](solution_round3_learning.py) updates its view of opponents throughout the game, including during its own lockout periods.
-
-1. **Observe.** Use changes in opponents' scores and lockout states to infer past accept/pass decisions.
-2. **Estimate.** Learn how likely each opponent is to accept the current reward and estimate the chance that nobody else takes it.
-3. **Value.** Compare the expected payout with the future score sacrificed during a lockout.
-4. **Act.** Randomize qualifying decisions to reduce collisions between teams following similar rules.
-
 ```mermaid
-flowchart TD
+flowchart LR
     A["Observe reward and game state"] --> B["Update opponent and payout histories"]
     B --> C{"Free to act with a valid reward and warmup complete?"}
     C -->|No| S["Skip"]
@@ -51,142 +44,59 @@ flowchart TD
     class S skip;
 ```
 
+The model keeps learning throughout the game, including while locked out:
+
+1. **Learn opponents.** Infer accept/pass decisions from score and lockout changes, building a history for each team.
+2. **Estimate the payout.** Use those histories and estimated opponent availability to predict whether a reward will go uncontested.
+3. **Price the wait.** Estimate the score sacrificed during a lockout, switching to a finite-horizon dynamic program for the final **150 rounds**.
+4. **Vary the decisions.** Randomize qualifying accepts to reduce repeated collisions between similar strategies.
+
 ## The mathematics
 
-### 1. Learn each opponent's acceptance behavior
+### Reward value after accounting for competition
 
-For opponent $j$ and a candidate reward $r$, count two kinds of evidence:
-
-- $A_j(r)$: observed accepts at rewards **at or below** $r$.
-- $B_j(r)$: observed passes at rewards **at or above** $r$.
-
-An accept at a smaller reward supports accepting $r$; a pass at a larger reward supports passing on $r$. One additional prior observation anchors the estimate to a single-player threshold $c_0$:
+Let $\widehat p_j(r)$ be opponent $j$'s estimated probability of accepting reward $r$, and $f_j$ its estimated probability of being free to act. Approximating opponents' choices as independent gives:
 
 $$
-\boxed{
-\widehat p_j(r)
-= \frac{A_j(r) + \mathbf{1}\{r > c_0\}}
-       {A_j(r) + B_j(r) + 1}
-}.
+\boxed{\widehat u(r) = r\prod_j\left(1-f_j\widehat p_j(r)\right)}.
 $$
 
-Here, $\mathbf{1}\{\cdot\}$ is 1 when its condition holds and 0 otherwise. Before any observations, the opponent is modeled as accepting above $c_0$ and passing below it.
+This is the reward multiplied by the estimated probability that nobody else accepts. The acceptance estimates combine observed choices with a single-player threshold prior, so the model can act before it has much evidence about an opponent.
 
-The prior starts from a single-player exponential-reward threshold and is reduced near the end of the game. Accept/pass histories are inferred from lockout transitions; score changes provide evidence about whether those flags describe the current or previous round.
+### The cost of accepting
 
-### 2. Discount rewards for collision risk
+During the main part of the game, the model estimates an achievable score rate from historical rewards that appeared uncontested. Multiplying that rate by the lockout length gives the opportunity cost $C$.
 
-Let $f_j$ be the estimated probability that opponent $j$ is currently free to act. Using a product approximation across opponents, the probability of an uncontested reward is:
-
-$$
-\widehat q(r)
-= \prod_j \left(1 - f_j\widehat p_j(r)\right).
-$$
-
-The reward's estimated collectible value is therefore:
+Near the end, the remaining time matters more. With $n$ rounds left and a lockout of $L$ rounds, the dynamic program uses:
 
 $$
-\boxed{\widehat u(r) = r\,\widehat q(r)}.
+\boxed{C_n = V_{n-1} - V_{\max(n-1-L,\,0)}}.
 $$
 
-A large reward may have a low expected payout if it attracts several opponents. A smaller reward can be more attractive when it is likely to go uncontested.
+Here, $V_n$ is the expected future score in a model built from historical payout samples. The threshold measures the future value lost by accepting now. On the final round, $C_1=0$: there are no later opportunities to sacrifice.
 
-### 3. Estimate the cost of a lockout
+### The decision rule
 
-For each resolved historical round, construct an inferred payout sample:
-
-$$
-x_i =
-\begin{cases}
- r_i, & \text{if no opponent was inferred to accept}, \\
- 0, & \text{otherwise}.
-\end{cases}
-$$
-
-These samples approximate what accepting those rewards would have paid before accounting for our own availability. Sort the $m$ samples in descending order, so $x_{(1)} \geq \cdots \geq x_{(m)}$.
-
-For a policy targeting the top $k$ samples, estimate the score earned per round, including the lockout time. With lockout length $L$:
+After **10 resolved observations**, an available team with a positive finite reward considers accepting when:
 
 $$
-\widehat g
-= \max_{1 \leq k \leq m}
-\frac{\sum_{i=1}^{k} x_{(i)}}{m + Lk}.
+\boxed{\widehat u(r) > sC}, \qquad s\sim\mathrm{Uniform}(0.85,1.15).
 $$
 
-The midgame opportunity-cost threshold is:
+The multiplier $s$ is drawn once per game; $C_n$ replaces $C$ in the endgame. A qualifying reward is then accepted with **60% probability**, introducing variation between otherwise similar decisions.
 
-$$
-\boxed{C = L\widehat g}.
-$$
-
-This translates a lockout into the estimated score forgone during those $L$ rounds. The estimate updates as new payout samples arrive.
-
-### 4. Adjust for the remaining horizon
-
-During the final **150 rounds**, the model replaces the long-run rate estimate with a dynamic program over the empirical payout samples.
-
-Let $V_n$ be the value in this empirical model when free to act with $n$ rounds remaining. The lockout cost is the difference between the future value after skipping and after accepting:
-
-$$
-C_n = V_{n-1} - V_{\max(n-1-L,\,0)}.
-$$
-
-Starting from $V_0 = 0$, compute:
-
-$$
-\boxed{
-V_n = V_{n-1}
-+ \frac{1}{m}\sum_{i=1}^{m}\max(x_i-C_n,\,0)
-}.
-$$
-
-The table is built from the samples available when the endgame calculation first runs and is reused for that lockout length. On the final round, $C_1 = 0$: there are no future opportunities to sacrifice.
-
-### 5. Randomize qualifying decisions
-
-Teams using the same deterministic rule can repeatedly choose the same rewards. The model introduces two sources of variation:
-
-| Mechanism | Setting | Purpose |
-|:---|:---|:---|
-| Per-game threshold multiplier | $s \sim \mathrm{Uniform}(0.85, 1.15)$ | Vary the acceptance threshold across games |
-| Per-decision acceptance draw | $U \sim \mathrm{Uniform}(0, 1)$ | Accept a qualifying reward with probability 0.6 |
-
-Once free to act, with a positive finite reward and at least **10 resolved payout samples**, the decision rule is:
-
-$$
-\boxed{
-\text{accept}
-\iff
-r\,\widehat q(r) > sC
-\quad\text{and}\quad
-U < 0.6
-}.
-$$
-
-In the endgame, $C_n$ replaces $C$.
+The estimates rely on inferred actions and approximate independence. Delayed lockout flags or correlated opponents can make them inaccurate; the model is a practical heuristic for the multiplayer game.
 
 ## Implementation
 
 | File | Role |
 |:---|:---|
 | [`solution_round3_learning.py`](solution_round3_learning.py) | Adaptive opponent-learning model described above |
-| [`solution.py`](solution.py) | Simpler baseline using a single-player threshold and a fixed acceptance band |
-| [`test.py`](test.py) | Client interface and runtime checks |
-| [`submit.py`](submit.py) | Submission of the strategy in `solution.py` |
+| [`solution.py`](solution.py) | Simpler threshold-based baseline, currently used by the test and submission scripts |
 
-**Entry point:** the existing test and submission scripts still load `solution.py`. To use the adaptive model with those scripts, place its implementation in `solution.py` first.
+To use the adaptive model with those scripts, copy its implementation into `solution.py`. The repository does not include a comparative performance benchmark between the two strategies.
 
-### Modeling assumptions
-
-The acceptance estimates are heuristics based on inferred actions. They assume threshold-like opponent behavior, while the product estimate of an uncontested reward approximates opponents' choices as independent. Delayed lockout flags and correlated strategies can make those estimates inaccurate.
-
-The endgame recurrence solves the empirical payout model; it does not solve the full multiplayer game. The repository does not include a comparative benchmark between the adaptive model and the baseline.
-
-## Attribution and original client documentation
-
-Built on the [G-Research Trading Game participant client](https://github.com/ajaykm3/gr_tradinggame_client). The client library and submission infrastructure come from that project; the strategy implementations are in `solution.py` and `solution_round3_learning.py`.
-
-The original client README is preserved below, including setup, testing, submission, and the strategy interface.
+Built on the [original participant client](https://github.com/ajaykm3/gr_tradinggame_client). Its README is preserved below.
 
 ---
 
